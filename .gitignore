@@ -1,0 +1,39 @@
+# Ambientes Virtuais (Venv, Conda, etc)
+venv/
+.venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+
+# Byte-compiled / Cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribuição / Pacotes
+bin/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Configurações de IDE (PyCharm, VSCode)
+.vscode/
+.idea/
+
+# Arquivos de Log e Dados Temporários
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
