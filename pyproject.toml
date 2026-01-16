@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ppa-maxent"
+version = "0.1.0"
+description = "Maximum Entropy image restoration with PPA-guided penalty control"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "Marcelo Pontes"}]
+dependencies = [
+  "numpy",
+  "scipy",
+  "matplotlib",
+  "scikit-image",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+ppa = "ppa_maxent.cli:main"
