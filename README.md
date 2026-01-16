@@ -65,3 +65,18 @@ src/
 Author
 ------
 Marcelo Pontes
+
+## Citation
+
+If you use this code in academic work, please cite the repository (tag **v0.1.0**):
+
+### BibTeX
+
+```bibtex
+@software{pontes_ppa_maxent_2026,
+  author  = {Marcelo Pontes},
+  title   = {PPA-MaxEnt: Maximum Entropy Image Restoration with Penalty Parameter Control},
+  year    = {2026},
+  version = {v0.1.0},
+  url     = {https://github.com/profmarcelopontes/ppa-maxent}
+}
