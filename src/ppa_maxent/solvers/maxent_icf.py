@@ -4,6 +4,7 @@
 # - inner_solver="mirror" (default): exponentiated-gradient mirror descent (KL geometry)
 #   + exponent clipping
 #   + flux normalization (default: "model" => sum(x)=sum(m); also "data" and "none")
+#   + NEW: line-search on alpha (Armijo decrease) to prevent collapse/divergence
 # - inner_solver="newton": simplified diagonal Newton + backtracking (robust baseline)
 #
 # Outer loop (PPA): increase rho based on feasibility ratio chi2/thresh and stop at chi_ratio_stop.
@@ -35,20 +36,26 @@ def _mirror_descent_inner(
     eps: float,
     flux_norm: str,
     exp_clip: float,
-    ls_max: int = 10,      # line-search max halvings
-    c_armijo: float = 1e-4 # Armijo constant (small)
+    # NEW: line search controls
+    ls_max: int,
+    c_armijo: float,
 ) -> np.ndarray:
     """
-    KL mirror descent with:
-      - exponent clipping
-      - flux normalization (model/data/none)
-      - line-search on alpha to ensure F decreases (critical for coupled chi2)
+    KL-mirror descent (Exponentiated Gradient) inner solver for fixed rho:
 
-    Proposal step:
-      x_trial = x * exp(clip(-alpha*g, ...))
-      (optional) flux normalize
-    Accept if:
-      F(x_trial) <= F(x) - c_armijo * alpha * ||g||_1
+        x <- x * exp(-alpha * grad)
+
+    with:
+        alpha0 = beta / max(1, ||grad||_1)
+
+    Stabilizers:
+      - exponent clipping: exp(clip(-alpha*g, -exp_clip, exp_clip))
+      - flux normalization (projection-like scaling):
+          "model": sum(x) = sum(m)   (DEFAULT)
+          "data" : sum(x) = sum(d)
+          "none" : no normalization
+      - NEW: Armijo line-search on alpha to ensure F decreases:
+          try alpha=alpha0; if F doesn't decrease enough, alpha <- alpha/2 (up to ls_max).
     """
     x = np.maximum(x_hat, eps).astype(np.float64, copy=False)
 
@@ -63,9 +70,17 @@ def _mirror_descent_inner(
         raise ValueError("flux_norm must be 'model', 'data', or 'none'")
 
     for _ in range(max_inner_steps):
+        # gradient at current x
         g = grad_F_penalty_chi2(
-            x.astype(np.float32), d, m, A_forward, A_adjoint,
-            sigma2, rho, thresh, eps=eps
+            x.astype(np.float32),
+            d,
+            m,
+            A_forward,
+            A_adjoint,
+            sigma2,
+            rho,
+            thresh,
+            eps=eps,
         )  # float64
 
         g1 = float(np.sum(np.abs(g)))
@@ -73,10 +88,17 @@ def _mirror_descent_inner(
         alpha0 = beta / gamma
 
         Fx = F_penalty_chi2(
-            x.astype(np.float32), d, m, A_forward,
-            sigma2, rho, thresh, eps=eps
+            x.astype(np.float32),
+            d,
+            m,
+            A_forward,
+            sigma2,
+            rho,
+            thresh,
+            eps=eps,
         )
 
+        # Line-search on alpha
         alpha = alpha0
         accepted = False
 
@@ -91,11 +113,18 @@ def _mirror_descent_inner(
                     x_try *= (target_sum / s)
 
             F_try = F_penalty_chi2(
-                x_try.astype(np.float32), d, m, A_forward,
-                sigma2, rho, thresh, eps=eps
+                x_try.astype(np.float32),
+                d,
+                m,
+                A_forward,
+                sigma2,
+                rho,
+                thresh,
+                eps=eps,
             )
 
-            # sufficient decrease (simple Armijo-like using ||g||_1)
+            # Sufficient decrease. We use a simple decrease proxy based on ||g||_1:
+            # require F_try <= F_x - c * alpha * ||g||_1
             if F_try <= Fx - c_armijo * alpha * g1:
                 x = x_try
                 accepted = True
@@ -104,7 +133,7 @@ def _mirror_descent_inner(
             alpha *= 0.5
 
         if not accepted:
-            # If no acceptable step, stop inner loop
+            # Can't find a decreasing step => stop inner loop
             break
 
     return x.astype(np.float32)
@@ -196,13 +225,15 @@ def maxent_icf_solver(
     rho_max: float = 1e2,
     max_outer: int = 120,
     # Inner solver selection
-    inner_solver: str = "mirror",  # default = mirror (as requested)
+    inner_solver: str = "mirror",  # default = mirror
     # Mirror params
-    beta0: float = 1.0,
-    beta_decay: float = 0.0,        # beta_k = beta0/(outer+1)^beta_decay
-    max_inner_steps: int = 40,
-    flux_norm: str = "model",       # DEFAULT: option 1 (sum(m)); also "data", "none"
+    beta0: float = 1e-2,           # safer default with line-search
+    beta_decay: float = 1.0,       # recommended for stability (paper-like)
+    max_inner_steps: int = 60,
+    flux_norm: str = "model",
     exp_clip: float = 50.0,
+    ls_max: int = 12,
+    c_armijo: float = 1e-6,
     # Newton params (alternative)
     tol: float = 1e-5,
     max_newton_steps: int = 40,
@@ -220,10 +251,6 @@ def maxent_icf_solver(
       - compute ratio r = chi2(x)/thresh
       - if r > chi_ratio_stop: rho <- min(k*rho, rho_max)
       - stop when r <= chi_ratio_stop
-
-    Inner solvers:
-      - mirror: exponentiated gradient + flux normalization (default)
-      - newton : diagonal Newton + backtracking (robust baseline)
     """
     if thresh is None:
         thresh = float(d.size)
@@ -267,6 +294,8 @@ def maxent_icf_solver(
                 eps=eps,
                 flux_norm=flux_norm,
                 exp_clip=exp_clip,
+                ls_max=ls_max,
+                c_armijo=c_armijo,
             )
         elif inner_solver.lower() == "newton":
             x_hat, converged = _newton_inner(
@@ -306,7 +335,7 @@ def maxent_icf_solver(
         if verbose:
             tag = " (converged)" if converged else ""
             if inner_solver.lower() == "mirror":
-                extra = f" beta={beta:.3e} flux_norm={flux_norm}"
+                extra = f" beta={beta:.3e} flux_norm={flux_norm} ls_max={ls_max}"
             else:
                 extra = ""
             print(

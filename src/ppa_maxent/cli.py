@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--max_outer", type=int, default=120)
 
     # Inner solver selection (DEFAULT: mirror)
-    parser.add_argument("--inner_solver", choices=["mirror", "newton"], default="mirror")
+    parser.add_argument("--inner_solver", choices=["mirror", "newton"], default="newton")
 
     # Mirror descent params (stability knobs included)
     parser.add_argument("--beta0", type=float, default=1.0)
