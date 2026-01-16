@@ -44,7 +44,7 @@ def run_demo(
     d = (x_blur + np.sqrt(sigma2) * rng.standard_normal(x_blur.shape)).astype(np.float32)
 
     # Restore
-    x_hat, lam_final, chi2_final, q = maxent_icf_solver(
+    x_hat, rho_final, chi2_final, q = maxent_icf_solver(
         d=d,
         m=m,
         sigma2=sigma2,
@@ -54,10 +54,11 @@ def run_demo(
         verbose=True
     )
 
+
     # Report
     thresh = float(d.size)
     print("\n--- Results ---")
-    print(f"Final lam      : {lam_final:.6e}")
+    print(f"Final rho      : {rho_final:.6e}")
     print(f"Final chi2     : {chi2_final:.6e} (thresh={thresh:.6e}) ratio={chi2_final/thresh:.3f}")
     print(f"q (scale)      : {q:.6e}")
     print(f"PSNR degraded  : {psnr(x_true, d):.3f} dB")
