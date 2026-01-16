@@ -1,3 +1,5 @@
+# src/ppa_maxent/experiments/demo_phantom.py
+
 import numpy as np
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
@@ -16,6 +18,7 @@ def run_demo(
     psnr_in: float = 45.0,
     seed: int = 0,
     chi_ratio_stop: float = 1.60,
+    **solver_kwargs,
 ):
     rng = np.random.default_rng(seed)
 
@@ -43,7 +46,7 @@ def run_demo(
     sigma2 = float(np.mean(x_blur.astype(np.float64) ** 2) / (10.0 ** (psnr_in / 10.0)))
     d = (x_blur + np.sqrt(sigma2) * rng.standard_normal(x_blur.shape)).astype(np.float32)
 
-    # Restore
+    # Restore (Option A PPA + inner solver selection)
     x_hat, rho_final, chi2_final, q = maxent_icf_solver(
         d=d,
         m=m,
@@ -51,9 +54,9 @@ def run_demo(
         A_forward=Aop.forward,
         A_adjoint=Aop.adjoint,
         chi_ratio_stop=chi_ratio_stop,
-        verbose=True
+        verbose=True,
+        **solver_kwargs,
     )
-
 
     # Report
     thresh = float(d.size)
@@ -64,7 +67,12 @@ def run_demo(
     print(f"PSNR degraded  : {psnr(x_true, d):.3f} dB")
     print(f"PSNR restored  : {psnr(x_true, x_hat):.3f} dB")
 
-    show_triplet(x_true, d, x_hat, title="MaxEnt + PPA (Package Structure)")
+    show_triplet(
+        x_true,
+        d,
+        x_hat,
+        title=f"MaxEnt + PPA Option A (inner={solver_kwargs.get('inner_solver','mirror')}, flux_norm={solver_kwargs.get('flux_norm','model')})",
+    )
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
 # src/ppa_maxent/solvers/maxent_icf.py
 #
-# Option A (PPA-style): MINIMIZE
-#   F_rho(x) = -S(x|m) + (rho/2) * max(0, chi2(x) - thresh)^2
+# PPA Option A (quadratic hinge penalty on chi2 violation) with selectable inner solver:
+# - inner_solver="mirror" (default): exponentiated-gradient mirror descent (KL geometry)
+#   + exponent clipping
+#   + flux normalization (default: "model" => sum(x)=sum(m); also "data" and "none")
+# - inner_solver="newton": simplified diagonal Newton + backtracking (robust baseline)
 #
-# Key fix for PPA behavior:
-# - Update rho based DIRECTLY on feasibility (chi2/thresh), not on inner-loop convergence.
-# - Use NORMALIZED violation in the diagonal scaling to avoid exploding curvature.
+# Outer loop (PPA): increase rho based on feasibility ratio chi2/thresh and stop at chi_ratio_stop.
+
+from __future__ import annotations
 
 import numpy as np
 
@@ -16,6 +19,168 @@ from ppa_maxent.core.functionals import (
 )
 
 
+def _mirror_descent_inner(
+    x_hat: np.ndarray,
+    d: np.ndarray,
+    m: np.ndarray,
+    sigma2: float,
+    A_forward,
+    A_adjoint,
+    *,
+    rho: float,
+    thresh: float,
+    q: float,
+    beta: float,
+    max_inner_steps: int,
+    eps: float,
+    flux_norm: str,
+    exp_clip: float,
+    ls_max: int = 10,      # line-search max halvings
+    c_armijo: float = 1e-4 # Armijo constant (small)
+) -> np.ndarray:
+    """
+    KL mirror descent with:
+      - exponent clipping
+      - flux normalization (model/data/none)
+      - line-search on alpha to ensure F decreases (critical for coupled chi2)
+
+    Proposal step:
+      x_trial = x * exp(clip(-alpha*g, ...))
+      (optional) flux normalize
+    Accept if:
+      F(x_trial) <= F(x) - c_armijo * alpha * ||g||_1
+    """
+    x = np.maximum(x_hat, eps).astype(np.float64, copy=False)
+
+    flux_norm_l = flux_norm.lower()
+    if flux_norm_l == "model":
+        target_sum = float(np.sum(m.astype(np.float64, copy=False)))
+    elif flux_norm_l == "data":
+        target_sum = float(np.sum(d.astype(np.float64, copy=False)))
+    elif flux_norm_l == "none":
+        target_sum = None
+    else:
+        raise ValueError("flux_norm must be 'model', 'data', or 'none'")
+
+    for _ in range(max_inner_steps):
+        g = grad_F_penalty_chi2(
+            x.astype(np.float32), d, m, A_forward, A_adjoint,
+            sigma2, rho, thresh, eps=eps
+        )  # float64
+
+        g1 = float(np.sum(np.abs(g)))
+        gamma = max(1.0, g1)
+        alpha0 = beta / gamma
+
+        Fx = F_penalty_chi2(
+            x.astype(np.float32), d, m, A_forward,
+            sigma2, rho, thresh, eps=eps
+        )
+
+        alpha = alpha0
+        accepted = False
+
+        for _ls in range(ls_max):
+            z = np.clip(-alpha * g, -exp_clip, exp_clip)
+            x_try = x * np.exp(z)
+            x_try = np.maximum(x_try, eps)
+
+            if target_sum is not None:
+                s = float(np.sum(x_try))
+                if s > 0.0:
+                    x_try *= (target_sum / s)
+
+            F_try = F_penalty_chi2(
+                x_try.astype(np.float32), d, m, A_forward,
+                sigma2, rho, thresh, eps=eps
+            )
+
+            # sufficient decrease (simple Armijo-like using ||g||_1)
+            if F_try <= Fx - c_armijo * alpha * g1:
+                x = x_try
+                accepted = True
+                break
+
+            alpha *= 0.5
+
+        if not accepted:
+            # If no acceptable step, stop inner loop
+            break
+
+    return x.astype(np.float32)
+
+
+def _newton_inner(
+    x_hat: np.ndarray,
+    d: np.ndarray,
+    m: np.ndarray,
+    sigma2: float,
+    A_forward,
+    A_adjoint,
+    *,
+    rho: float,
+    thresh: float,
+    q: float,
+    max_newton_steps: int,
+    max_backtrack: int,
+    tol: float,
+    eps: float,
+) -> tuple[np.ndarray, bool]:
+    """
+    Simplified diagonal Newton + backtracking inner solver for fixed rho.
+    Minimizes F_rho(x) with positivity enforced.
+    """
+    x = np.maximum(x_hat.astype(np.float64, copy=False), eps)
+    converged = False
+
+    for _ in range(max_newton_steps):
+        g = grad_F_penalty_chi2(
+            x.astype(np.float32),
+            d,
+            m,
+            A_forward,
+            A_adjoint,
+            sigma2,
+            rho,
+            thresh,
+            eps=eps,
+        )
+
+        chi2_here = chi2_awgn(x.astype(np.float32), d, A_forward, sigma2)
+        v = max(0.0, (chi2_here / thresh) - 1.0)  # normalized violation for scaling
+
+        denom = (1.0 / np.maximum(x, eps)) + 2.0 * rho * v * q
+        denom = np.maximum(denom, 1e-18)
+
+        v_dir = (-g / denom).astype(np.float64)  # descent direction
+
+        p = 1.0
+        Fx = F_penalty_chi2(x.astype(np.float32), d, m, A_forward, sigma2, rho, thresh, eps=eps)
+        gv = float(np.sum(g * v_dir))
+
+        for _bt in range(max_backtrack):
+            x_try = x + p * v_dir
+            if np.any(x_try <= 0):
+                p *= 0.5
+                continue
+
+            F_try = F_penalty_chi2(
+                x_try.astype(np.float32), d, m, A_forward, sigma2, rho, thresh, eps=eps
+            )
+            if (F_try - Fx) <= 0.5 * p * gv:
+                break
+            p *= 0.5
+
+        step = p * v_dir
+        x = np.maximum(x + step, eps)
+
+        if np.linalg.norm(step.ravel()) < tol:
+            converged = True
+            break
+
+    return x.astype(np.float32), converged
+
+
 def maxent_icf_solver(
     d: np.ndarray,
     m: np.ndarray,
@@ -23,157 +188,115 @@ def maxent_icf_solver(
     A_forward,
     A_adjoint,
     *,
-    # PPA (Option A) knobs
+    # Outer PPA (Option A)
     rho_small: float = 1e-6,
-    k: float = 2.0,                 # multiplicative factor for rho growth
-    tol: float = 1e-5,
-    thresh: float | None = None,    # tau ~= N (number of pixels)
-    chi_ratio_stop: float = 1.60,   # stop when chi2/thresh <= this
-    # runtime knobs
+    k: float = 2.0,
+    thresh: float | None = None,
+    chi_ratio_stop: float = 1.60,
+    rho_max: float = 1e2,
     max_outer: int = 120,
+    # Inner solver selection
+    inner_solver: str = "mirror",  # default = mirror (as requested)
+    # Mirror params
+    beta0: float = 1.0,
+    beta_decay: float = 0.0,        # beta_k = beta0/(outer+1)^beta_decay
+    max_inner_steps: int = 40,
+    flux_norm: str = "model",       # DEFAULT: option 1 (sum(m)); also "data", "none"
+    exp_clip: float = 50.0,
+    # Newton params (alternative)
+    tol: float = 1e-5,
     max_newton_steps: int = 40,
     max_backtrack: int = 25,
-    rho_max: float = 1e2,
     # stability / scaling
     eps: float = 1e-12,
-    q: float | None = None,         # scale factor approx of A^T A (energy)
+    q: float | None = None,
     verbose: bool = True,
 ):
     """
-    MaxEnt + ICF solver using PPA Option A (quadratic penalty on violation), as a MINIMIZATION.
+    PPA Option A outer loop + selectable inner solver.
 
-    We solve:
-        minimize_{x>0} F_rho(x) = -S(x|m) + (rho/2) * max(0, chi2(x) - thresh)^2
+    Outer loop:
+      - approximately solve min_x F_rho(x) for fixed rho
+      - compute ratio r = chi2(x)/thresh
+      - if r > chi_ratio_stop: rho <- min(k*rho, rho_max)
+      - stop when r <= chi_ratio_stop
 
-    where:
-        S(x|m) : Skilling relative entropy (PAD form)
-        chi2(x): AWGN chi-square
-        thresh : tau (usually N = number of pixels/measurements)
-        rho    : penalty parameter (PPA-style)
-
-    Notes:
-      - d, m are expected float32 images
-      - internal math uses float64 for stability
-      - A_forward and A_adjoint are typically FFT operators for speed
+    Inner solvers:
+      - mirror: exponentiated gradient + flux normalization (default)
+      - newton : diagonal Newton + backtracking (robust baseline)
     """
     if thresh is None:
         thresh = float(d.size)
 
-    x_hat = np.maximum(m.astype(np.float64, copy=False), eps)
+    x_hat = np.maximum(m.astype(np.float64, copy=False), eps).astype(np.float32)
     rho = float(rho_small)
 
-    # Estimate q if not provided: use energy of impulse response (same-shaped kernel response)
+    # q estimate if not provided: energy of impulse response
     if q is None:
         impulse = np.zeros_like(d, dtype=np.float32)
         impulse[d.shape[0] // 2, d.shape[1] // 2] = 1.0
         k_eff_same = A_forward(impulse).astype(np.float64)
         q = float(np.sum(k_eff_same * k_eff_same) / sigma2)
 
-    chi2_val = chi2_awgn(x_hat.astype(np.float32), d, A_forward, sigma2)
-
-    # Keep a short history to detect stagnation (optional)
+    chi2_val = chi2_awgn(x_hat, d, A_forward, sigma2)
     ratio_hist: list[float] = [chi2_val / thresh]
 
     for outer in range(max_outer):
         ratio = chi2_val / thresh
-
-        # Relaxed feasibility stop (practical)
         if ratio <= chi_ratio_stop:
             if verbose:
                 print(f"[outer {outer:02d}] STOP: chi2/thresh={ratio:.3f} <= {chi_ratio_stop}")
             break
 
-        # -------------------------
-        # Inner minimization at fixed rho
-        # -------------------------
+        beta = beta0 if beta_decay <= 0 else float(beta0 / ((outer + 1) ** beta_decay))
         converged = False
-        for _ in range(max_newton_steps):
-            # Gradient of F_rho (Option A)
-            g = grad_F_penalty_chi2(
-                x_hat.astype(np.float32),
+
+        if inner_solver.lower() == "mirror":
+            x_hat = _mirror_descent_inner(
+                x_hat,
                 d,
                 m,
+                sigma2,
                 A_forward,
                 A_adjoint,
-                sigma2,
-                rho,
-                thresh,
+                rho=rho,
+                thresh=thresh,
+                q=q,
+                beta=beta,
+                max_inner_steps=max_inner_steps,
                 eps=eps,
+                flux_norm=flux_norm,
+                exp_clip=exp_clip,
             )
-
-            # Current chi2 and NORMALIZED violation for diagonal scaling
-            chi2_here = chi2_awgn(x_hat.astype(np.float32), d, A_forward, sigma2)
-            v = max(0.0, (chi2_here / thresh) - 1.0)  # normalized violation
-
-            # Stable simplified diagonal model for MINIMIZATION:
-            # - entropy contributes ~ (1/x)
-            # - penalty curvature scales with rho * v and A^T A energy ~ q
-            denom = (1.0 / np.maximum(x_hat, eps)) + 2.0 * rho * v * q
-            denom = np.maximum(denom, 1e-18)
-
-            # Descent direction: v_dir = - H^{-1} g
-            v_dir = (-g / denom).astype(np.float64)
-
-            p = 1.0
-            Fx = F_penalty_chi2(
-                x_hat.astype(np.float32),
+        elif inner_solver.lower() == "newton":
+            x_hat, converged = _newton_inner(
+                x_hat,
                 d,
                 m,
-                A_forward,
                 sigma2,
-                rho,
-                thresh,
+                A_forward,
+                A_adjoint,
+                rho=rho,
+                thresh=thresh,
+                q=q,
+                max_newton_steps=max_newton_steps,
+                max_backtrack=max_backtrack,
+                tol=tol,
                 eps=eps,
             )
+        else:
+            raise ValueError("inner_solver must be 'mirror' or 'newton'")
 
-            gv = float(np.sum(g * v_dir))  # should be <= 0 for descent direction
-
-            # Backtracking (Armijo decrease + positivity)
-            for _bt in range(max_backtrack):
-                x_try = x_hat + p * v_dir
-
-                if np.any(x_try <= 0):
-                    p *= 0.5
-                    continue
-
-                F_try = F_penalty_chi2(
-                    x_try.astype(np.float32),
-                    d,
-                    m,
-                    A_forward,
-                    sigma2,
-                    rho,
-                    thresh,
-                    eps=eps,
-                )
-
-                # Minimization Armijo:
-                if (F_try - Fx) <= 0.5 * p * gv:
-                    break
-
-                p *= 0.5
-
-            step = p * v_dir
-            x_hat = np.maximum(x_hat + step, eps)
-
-            if np.linalg.norm(step.ravel()) < tol:
-                converged = True
-                break
-
-        # Update chi2 and feasibility ratio
-        chi2_new = chi2_awgn(x_hat.astype(np.float32), d, A_forward, sigma2)
+        chi2_new = chi2_awgn(x_hat, d, A_forward, sigma2)
         chi2_val = chi2_new
         ratio = chi2_val / thresh
         ratio_hist.append(ratio)
 
-        # -------------------------
-        # PPA update (CRITICAL FIX)
-        # Increase rho based on violation (feasibility), not on inner-loop convergence.
-        # -------------------------
+        # PPA update: feasibility-driven
         if ratio > chi_ratio_stop:
             rho = min(rho * k, rho_max)
 
-        # Optional: if ratio stalls, push rho harder (helps escape flat regions)
+        # optional: if ratio stalls, push rho harder
         if len(ratio_hist) > 6:
             old = ratio_hist[-6]
             rel_impr = (old - ratio) / max(old, 1e-30)
@@ -182,6 +305,13 @@ def maxent_icf_solver(
 
         if verbose:
             tag = " (converged)" if converged else ""
-            print(f"[outer {outer:02d}] rho={rho:.3e} chi2={chi2_val:.3e} (chi2/thresh={ratio:.3f}){tag}")
+            if inner_solver.lower() == "mirror":
+                extra = f" beta={beta:.3e} flux_norm={flux_norm}"
+            else:
+                extra = ""
+            print(
+                f"[outer {outer:02d}] rho={rho:.3e} chi2={chi2_val:.3e} "
+                f"(chi2/thresh={ratio:.3f}){tag}{extra}"
+            )
 
     return x_hat.astype(np.float32), rho, chi2_val, q
